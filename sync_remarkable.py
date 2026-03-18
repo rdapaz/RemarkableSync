@@ -165,7 +165,7 @@ def rmapi_upload(local_path: Path, remote_folder: str) -> bool:
         clean_path = Path(tmp) / local_path.name
         shutil.copy2(local_path, clean_path)
         # Use just the filename as the argument, with cwd set to the temp dir
-        cmd = [RMAPI, "put", local_path.name, remote_folder]
+        cmd = [RMAPI, "put", "--force", local_path.name, remote_folder]
         log.debug(f"Running: {' '.join(cmd)}")
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=60,
@@ -321,9 +321,9 @@ def _resolve_obsidian_images(md_text: str, md_path: Path) -> str:
 
         image_path = _find_image_in_vault(image_name, md_path)
         if image_path:
-            # Use file:/// URI for the absolute path
-            abs_path = str(image_path.resolve()).replace("\\", "/")
-            return f'![{image_name}](file:///{abs_path})'
+            # Use the raw absolute path (works with fpdf2 on Windows)
+            abs_path = str(image_path.resolve())
+            return f'![{image_name}]({abs_path})'
         else:
             log.warning(f"  Image not found: {image_name}")
             return f"*[Image: {image_name}]*"
@@ -356,18 +356,6 @@ def md_to_pdf(md_path: Path, pdf_path: Path) -> bool:
             md_text,
             extensions=["tables", "fenced_code", "codehilite", "nl2br"],
         )
-
-        # Convert file:/// image URIs to local paths for fpdf2
-        def fix_img_src(match):
-            attrs = match.group(1)
-            attrs = re.sub(
-                r'src="file:///([^"]+)"',
-                lambda m: f'src="{m.group(1)}"',
-                attrs,
-            )
-            return f"<img {attrs}"
-
-        html = re.sub(r"<img (.+?)", fix_img_src, html)
 
         # Set base font for body text — large for e-ink readability
         pdf.set_font("Helvetica", size=13)
