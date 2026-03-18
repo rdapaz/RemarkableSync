@@ -3,10 +3,13 @@
 Obsidian <-> reMarkable Two-Way Sync
 
 Syncs markdown notes from an Obsidian vault to a reMarkable tablet as PDFs,
-and pulls annotated PDFs back from the reMarkable into the vault.
+and pulls annotated PDFs (with handwriting/scribbles rendered) back into the vault.
 
-Dependencies (pip):  watchdog, fpdf2, markdown
-External:           rmapi.exe (bundled in this folder)
+Supports reMarkable v6 .rm annotation format (firmware v3+) via rmscene/rmc.
+
+Dependencies (pip):  fpdf2, markdown, watchdog, rmc, rmscene, PyMuPDF, svglib,
+                     svgwrite, reportlab
+External:           rmapi (https://github.com/ddvk/rmapi/releases)
 
 Usage:
     python sync_remarkable.py              # One-shot sync (both directions)
@@ -19,16 +22,24 @@ Usage:
 import subprocess
 import json
 import hashlib
+import os
+import shutil
 import sys
 import re
 import argparse
 import logging
+import tempfile
+import zipfile
 from pathlib import Path
 from datetime import datetime
 
 import markdown
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
+from rmc import rm_to_svg
+from svglib.svglib import svg2rlg
+from reportlab.graphics import renderPDF
+import fitz  # PyMuPDF
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -89,10 +100,19 @@ def check_rmapi():
 # ─── rmapi Helpers ───────────────────────────────────────────────────────────
 
 
+def _rmapi_env() -> dict:
+    """Environment for rmapi subprocesses — prevents MSYS/Git Bash path mangling."""
+    env = os.environ.copy()
+    env["MSYS_NO_PATHCONV"] = "1"
+    env["MSYS2_ARG_CONV_EXCL"] = "*"
+    return env
+
+
 def rmapi_run(args: list[str], check=True) -> subprocess.CompletedProcess:
     cmd = [RMAPI] + args
     log.debug(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                            env=_rmapi_env())
     if check and result.returncode != 0:
         log.error(f"rmapi error: {result.stderr.strip()}")
     return result
@@ -119,24 +139,110 @@ def rmapi_mkdir(folder: str):
 
 
 def rmapi_upload(local_path: Path, remote_folder: str) -> bool:
-    result = rmapi_run(["put", str(local_path), remote_folder])
+    """Upload a file to reMarkable. Runs rmapi from a temp dir with just the
+    filename so the document name on the tablet is clean."""
+    with tempfile.TemporaryDirectory() as tmp:
+        clean_path = Path(tmp) / local_path.name
+        shutil.copy2(local_path, clean_path)
+        # Use just the filename as the argument, with cwd set to the temp dir
+        cmd = [RMAPI, "put", local_path.name, remote_folder]
+        log.debug(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60,
+            env=_rmapi_env(), cwd=tmp,
+        )
+        if result.returncode != 0:
+            log.error(f"rmapi error: {result.stderr.strip()}")
     return result.returncode == 0
 
 
 def rmapi_download(remote_path: str, local_dir: Path) -> bool:
+    """Download raw .rmdoc using 'get' (not 'geta') so we can render
+    annotations ourselves — rmapi's built-in renderer fails on v6 .rm files."""
     local_dir.mkdir(parents=True, exist_ok=True)
+    env = _rmapi_env()
     result = subprocess.run(
-        [RMAPI, "geta", remote_path],
+        [RMAPI, "get", remote_path],
         capture_output=True, text=True, timeout=120,
-        cwd=str(local_dir),
+        cwd=str(local_dir), env=env,
     )
-    if result.returncode != 0:
-        result = subprocess.run(
-            [RMAPI, "get", remote_path],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(local_dir),
-        )
     return result.returncode == 0
+
+
+def render_rmdoc_to_pdf(rmdoc_path: Path, output_pdf: Path) -> bool:
+    """Render an .rmdoc archive to PDF with annotations overlaid."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Extract the rmdoc (zip) contents
+            with zipfile.ZipFile(rmdoc_path, "r") as z:
+                z.extractall(tmp_path)
+
+            rm_files = sorted(tmp_path.rglob("*.rm"))
+            pdf_files = list(tmp_path.rglob("*.pdf"))
+
+            has_base_pdf = bool(pdf_files)
+
+            if not rm_files and not has_base_pdf:
+                log.warning(f"No content in {rmdoc_path.name}")
+                return False
+
+            if has_base_pdf and not rm_files:
+                # No annotations — just copy the original PDF
+                shutil.copy2(pdf_files[0], output_pdf)
+                return True
+
+            # Render each .rm page to SVG -> PDF
+            page_pdfs = []
+            for i, rm_file in enumerate(rm_files):
+                svg_path = tmp_path / f"ann_{i}.svg"
+                ann_pdf_path = tmp_path / f"ann_{i}.pdf"
+
+                rm_to_svg(str(rm_file), str(svg_path))
+
+                drawing = svg2rlg(str(svg_path))
+                if drawing is None:
+                    continue
+                renderPDF.drawToFile(drawing, str(ann_pdf_path))
+                page_pdfs.append(ann_pdf_path)
+
+            if has_base_pdf:
+                # Overlay annotations on existing PDF
+                orig = fitz.open(str(pdf_files[0]))
+                for i, ann_pdf_path in enumerate(page_pdfs):
+                    page_idx = min(i, len(orig) - 1)
+                    page = orig[page_idx]
+                    ann_doc = fitz.open(str(ann_pdf_path))
+                    page.show_pdf_page(page.rect, ann_doc, 0, overlay=True)
+                    ann_doc.close()
+                orig.save(str(output_pdf))
+                orig.close()
+            else:
+                # Handwritten-only notebook — merge annotation pages into
+                # a new PDF (reMarkable page size: 1404x1872 px @ 226 DPI)
+                RM_WIDTH_PT = 1404 * 72 / 226   # ~447.6 pt
+                RM_HEIGHT_PT = 1872 * 72 / 226   # ~596.7 pt
+                doc = fitz.open()
+                for ann_pdf_path in page_pdfs:
+                    page = doc.new_page(
+                        width=RM_WIDTH_PT, height=RM_HEIGHT_PT
+                    )
+                    ann_doc = fitz.open(str(ann_pdf_path))
+                    page.show_pdf_page(page.rect, ann_doc, 0, overlay=True)
+                    ann_doc.close()
+                if len(doc) == 0:
+                    log.warning(f"No renderable pages in {rmdoc_path.name}")
+                    doc.close()
+                    return False
+                doc.save(str(output_pdf))
+                doc.close()
+
+            return True
+
+    except Exception as e:
+        log.error(f"Failed to render {rmdoc_path.name}: {e}")
+        return False
 
 
 # ─── Markdown to PDF (pure Python) ──────────────────────────────────────────
@@ -261,32 +367,55 @@ def pull_sync(state: dict) -> int:
 
         name = item["name"]
         remote_path = f"{REMARKABLE_FOLDER}/{name}"
+        final_pdf = ANNOTATIONS_DIR / f"{name}.pdf"
 
         log.info(f"Downloading: {remote_path}")
-        if rmapi_download(remote_path, ANNOTATIONS_DIR):
-            downloaded = list(ANNOTATIONS_DIR.glob(f"{name}*"))
-            if downloaded:
-                state.setdefault("pulled", {})[name] = {
-                    "local_path": str(downloaded[0]),
-                    "pulled_at": datetime.now().isoformat(),
-                }
-                pulled_count += 1
-                log.info(f"  Downloaded: {downloaded[0].name}")
-
-                # Create a stub .md note for NEW files from reMarkable
-                if name not in pushed_pdfs and not name.endswith(".pdf"):
-                    stub_path = VAULT_PATH / f"{name}.md"
-                    if not stub_path.exists():
-                        stub_path.write_text(
-                            f"# {name}\n\n"
-                            f"*Imported from reMarkable on "
-                            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n"
-                            f"![[_annotations/{downloaded[0].name}]]\n",
-                            encoding="utf-8",
-                        )
-                        log.info(f"  Created stub note: {stub_path.name}")
-        else:
+        if not rmapi_download(remote_path, ANNOTATIONS_DIR):
             log.warning(f"  Download failed for {name}")
+            continue
+
+        # rmapi downloads as .rmdoc or .zip — find whatever it created
+        downloaded = list(ANNOTATIONS_DIR.glob(f"{name}.*"))
+        if not downloaded:
+            log.warning(f"  No file found after download for {name}")
+            continue
+
+        dl_file = downloaded[0]
+        log.info(f"  Downloaded: {dl_file.name}")
+
+        # Extract the PDF from .rmdoc/.zip archives
+        if dl_file.suffix in (".rmdoc", ".zip"):
+            if render_rmdoc_to_pdf(dl_file, final_pdf):
+                log.info(f"  Extracted: {final_pdf.name}")
+                # Clean up the archive
+                dl_file.unlink(missing_ok=True)
+            else:
+                log.warning(f"  Could not render PDF from {dl_file.name}")
+                continue
+        elif dl_file.suffix == ".pdf":
+            # Already a PDF, just rename if needed
+            if dl_file != final_pdf:
+                shutil.move(str(dl_file), str(final_pdf))
+
+        if final_pdf.exists():
+            state.setdefault("pulled", {})[name] = {
+                "local_path": str(final_pdf),
+                "pulled_at": datetime.now().isoformat(),
+            }
+            pulled_count += 1
+
+            # Create a stub .md note for NEW files from reMarkable
+            if f"{name}.pdf" not in pushed_pdfs:
+                stub_path = VAULT_PATH / f"{name}.md"
+                if not stub_path.exists():
+                    stub_path.write_text(
+                        f"# {name}\n\n"
+                        f"*Imported from reMarkable on "
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n"
+                        f"![[_annotations/{name}.pdf]]\n",
+                        encoding="utf-8",
+                    )
+                    log.info(f"  Created stub note: {stub_path.name}")
 
     return pulled_count
 

@@ -1,8 +1,10 @@
-# rmapi binary (downloaded during setup)
+# rmapi binary (downloaded during setup — platform-specific)
 rmapi.exe
+rmapi
 
 # Logs
 sync.log
+*.log
 
 # Python
 __pycache__/
@@ -10,10 +12,16 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+*.egg-info/
+
+# Temp files from annotation rendering
+_tmp/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS
 Thumbs.db
