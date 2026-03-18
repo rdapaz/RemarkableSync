@@ -23,6 +23,9 @@ _tmp/
 *.swp
 *.swo
 
+# Wrapper scripts (contain user-specific paths)
+run_sync.bat
+
 # OS
 Thumbs.db
 Desktop.ini
