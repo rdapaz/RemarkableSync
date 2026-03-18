@@ -290,6 +290,48 @@ class RemarkablePDF(FPDF):
         self.set_text_color(0, 0, 0)
 
 
+def _find_image_in_vault(image_name: str, md_path: Path) -> Path | None:
+    """Find an Obsidian-embedded image by searching common locations."""
+    # 1. Same directory as the note
+    candidate = md_path.parent / image_name
+    if candidate.exists():
+        return candidate
+
+    # 2. Anywhere in the vault (Obsidian's default — shortest path match)
+    matches = list(VAULT_PATH.rglob(image_name))
+    if matches:
+        return matches[0]
+
+    return None
+
+
+def _resolve_obsidian_images(md_text: str, md_path: Path) -> str:
+    """Convert Obsidian ![[image.png]] and ![[image.png|width]] syntax
+    to standard markdown ![](path) so the markdown library can handle them."""
+
+    def replace_wiki_image(match):
+        content = match.group(1)
+        # Handle ![[image.png|600]] (width) and ![[image.png|alt text]]
+        parts = content.split("|", 1)
+        image_name = parts[0].strip()
+
+        # Only process image file extensions
+        if not re.search(r"\.(png|jpe?g|gif|bmp|svg|webp)$", image_name, re.IGNORECASE):
+            return match.group(0)  # Not an image — leave as-is
+
+        image_path = _find_image_in_vault(image_name, md_path)
+        if image_path:
+            # Use file:/// URI for the absolute path
+            abs_path = str(image_path.resolve()).replace("\\", "/")
+            return f'![{image_name}](file:///{abs_path})'
+        else:
+            log.warning(f"  Image not found: {image_name}")
+            return f"*[Image: {image_name}]*"
+
+    # Match ![[anything.ext]] or ![[anything.ext|size/alt]]
+    return re.sub(r"!\[\[([^\]]+)\]\]", replace_wiki_image, md_text)
+
+
 def md_to_pdf(md_path: Path, pdf_path: Path) -> bool:
     """Convert a markdown file to a PDF optimized for reMarkable e-ink."""
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +343,9 @@ def md_to_pdf(md_path: Path, pdf_path: Path) -> bool:
 
     log.info(f"Converting: {md_path.name} -> PDF")
 
+    # Pre-process: resolve Obsidian wiki-link images to standard markdown
+    md_text = _resolve_obsidian_images(md_text, md_path)
+
     try:
         pdf = RemarkablePDF(title=md_path.stem)
         pdf.add_page()
@@ -311,6 +356,18 @@ def md_to_pdf(md_path: Path, pdf_path: Path) -> bool:
             md_text,
             extensions=["tables", "fenced_code", "codehilite", "nl2br"],
         )
+
+        # Convert file:/// image URIs to local paths for fpdf2
+        def fix_img_src(match):
+            attrs = match.group(1)
+            attrs = re.sub(
+                r'src="file:///([^"]+)"',
+                lambda m: f'src="{m.group(1)}"',
+                attrs,
+            )
+            return f"<img {attrs}"
+
+        html = re.sub(r"<img (.+?)", fix_img_src, html)
 
         # Set base font for body text — large for e-ink readability
         pdf.set_font("Helvetica", size=13)
