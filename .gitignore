@@ -1,0 +1,21 @@
+# rmapi binary (downloaded during setup)
+rmapi.exe
+
+# Logs
+sync.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
