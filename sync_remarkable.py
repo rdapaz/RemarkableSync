@@ -17,6 +17,9 @@ Usage:
     python sync_remarkable.py --push       # Only push Obsidian -> reMarkable
     python sync_remarkable.py --pull       # Only pull reMarkable -> Obsidian
     python sync_remarkable.py --setup      # First-time setup (register rmapi)
+
+    # Use with a different vault/folder:
+    python sync_remarkable.py --vault "D:\Vaults\Work" --folder "/Work"
 """
 
 import subprocess
@@ -44,14 +47,31 @@ import fitz  # PyMuPDF
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-VAULT_PATH = Path(r"D:\Vaults\Remarkable\remarkable")
-REMARKABLE_FOLDER = "/Obsidian"
-SYNC_DIR = VAULT_PATH.parent / ".sync"
-STATE_FILE = SYNC_DIR / "state.json"
-PDF_CACHE = SYNC_DIR / "pdfs"
-ANNOTATIONS_DIR = VAULT_PATH / "_annotations"
 RMAPI = str(SCRIPT_DIR / "rmapi.exe")
 LOG_FILE = SCRIPT_DIR / "sync.log"
+
+# Defaults — can be overridden via --vault and --folder CLI args
+DEFAULT_VAULT_PATH = Path(r"D:\Vaults\Remarkable\remarkable")
+DEFAULT_REMARKABLE_FOLDER = "/Obsidian"
+
+# These globals are set in main() based on CLI args
+VAULT_PATH: Path = DEFAULT_VAULT_PATH
+REMARKABLE_FOLDER: str = DEFAULT_REMARKABLE_FOLDER
+SYNC_DIR: Path = DEFAULT_VAULT_PATH.parent / ".sync"
+STATE_FILE: Path = SYNC_DIR / "state.json"
+PDF_CACHE: Path = SYNC_DIR / "pdfs"
+ANNOTATIONS_DIR: Path = DEFAULT_VAULT_PATH / "_annotations"
+
+
+def configure(vault_path: Path, remarkable_folder: str):
+    """Set all derived paths from the vault path and reMarkable folder."""
+    global VAULT_PATH, REMARKABLE_FOLDER, SYNC_DIR, STATE_FILE, PDF_CACHE, ANNOTATIONS_DIR
+    VAULT_PATH = vault_path
+    REMARKABLE_FOLDER = remarkable_folder
+    SYNC_DIR = VAULT_PATH.parent / ".sync"
+    STATE_FILE = SYNC_DIR / "state.json"
+    PDF_CACHE = SYNC_DIR / "pdfs"
+    ANNOTATIONS_DIR = VAULT_PATH / "_annotations"
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -539,6 +559,10 @@ def poll_and_sync():
 
 def main():
     parser = argparse.ArgumentParser(description="Obsidian <-> reMarkable Sync")
+    parser.add_argument("--vault", type=str, default=None,
+                        help=f"Path to Obsidian vault (default: {DEFAULT_VAULT_PATH})")
+    parser.add_argument("--folder", type=str, default=None,
+                        help=f"reMarkable folder to sync with (default: {DEFAULT_REMARKABLE_FOLDER})")
     parser.add_argument("--setup", action="store_true", help="First-time setup")
     parser.add_argument("--watch", action="store_true", help="Watch and sync continuously")
     parser.add_argument("--push", action="store_true", help="Only push to reMarkable")
@@ -546,8 +570,16 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
+    # Apply vault/folder overrides
+    vault = Path(args.vault) if args.vault else DEFAULT_VAULT_PATH
+    folder = args.folder if args.folder else DEFAULT_REMARKABLE_FOLDER
+    configure(vault, folder)
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    log.info(f"Vault: {VAULT_PATH}")
+    log.info(f"reMarkable folder: {REMARKABLE_FOLDER}")
 
     if args.setup:
         setup()
